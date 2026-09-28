@@ -1,0 +1,20 @@
+.omni/
+.claude/
+.github/
+.cursor/
+.kiro/
+.agents/
+.env.omni
+
+# Only cloudformation/ and terraform/ folders are tracked.
+# Everything below is a generated Terraform artifact, not source.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl.bak
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*.tfvars
+*.tfvars.json

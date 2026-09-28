@@ -1,0 +1,39 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  VPC Lab - Part 2: Peers SITE_A-VPC and SITE_B-VPC and adds the routes each
+  side needs to reach the other's CIDR through the peering connection.
+  Depends on Part 1 (part1-vpcs-ec2.yaml) having already been deployed, since
+  it imports that stack's exported VPC/route table IDs.
+
+Resources:
+
+  SiteAToSiteBPeering:
+    Type: AWS::EC2::VPCPeeringConnection
+    Properties:
+      VpcId: !ImportValue VpcLab-SiteA-VpcId
+      PeerVpcId: !ImportValue VpcLab-SiteB-VpcId
+      Tags:
+        - Key: Name
+          Value: SITE_A-to-SITE_B-Peering
+
+  # Route in SITE_A's route table: traffic to SITE_B's CIDR -> peering connection
+  SiteARouteToSiteB:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !ImportValue VpcLab-SiteA-RouteTableId
+      DestinationCidrBlock: !ImportValue VpcLab-SiteB-VpcCidr
+      VpcPeeringConnectionId: !Ref SiteAToSiteBPeering
+
+  # Route in SITE_B's route table: traffic to SITE_A's CIDR -> peering connection
+  SiteBRouteToSiteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !ImportValue VpcLab-SiteB-RouteTableId
+      DestinationCidrBlock: !ImportValue VpcLab-SiteA-VpcCidr
+      VpcPeeringConnectionId: !Ref SiteAToSiteBPeering
+
+Outputs:
+  PeeringConnectionId:
+    Value: !Ref SiteAToSiteBPeering
+    Export:
+      Name: VpcLab-SiteA-SiteB-PeeringId

@@ -1,0 +1,439 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  VPC Lab - Part 3: Creates SITE_C-VPC and SITE_D-VPC (private subnets, no
+  IGW/NAT/public IPs, with SSM interface endpoints - same pattern as Part 1),
+  provisions a Transit Gateway, attaches all four VPCs (A, B, C, D) to it,
+  builds an explicit Transit Gateway route table with per-VPC propagation,
+  and updates every VPC's route table to send inter-VPC traffic to the TGW.
+
+  IMPORTANT: Before deploying this stack, delete the Part 2 peering stack
+  (part2-vpc-peering.yaml) first - SITE_A and SITE_B's route tables cannot
+  hold two routes to the same destination CIDR (one via peering, one via TGW).
+  See the deployment guide for the exact order of operations.
+
+Parameters:
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t2.micro]
+
+  LabSupernetCidr:
+    Type: String
+    Default: 10.0.0.0/8
+    Description: >
+      Covers all four lab VPCs (10.0.0.0/16 - 10.3.0.0/16). Each VPC route
+      table gets ONE route for this supernet pointed at the TGW; the VPC's
+      own local route (added automatically by AWS) always wins for
+      same-VPC traffic because it's the more specific /16 match.
+
+Resources:
+
+  ###########################################################################
+  # SITE_C-VPC (fully private - no IGW, no NAT, no public IPs)
+  ###########################################################################
+  SiteCVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.2.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: SITE_C-VPC
+
+  SiteCPrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref SiteCVpc
+      CidrBlock: 10.2.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: SITE_C-Private-Subnet
+
+  SiteCRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref SiteCVpc
+      Tags:
+        - Key: Name
+          Value: SITE_C-Private-RT
+
+  SiteCSubnetRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SiteCPrivateSubnet
+      RouteTableId: !Ref SiteCRouteTable
+
+  SiteCSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SITE_C instance SG - ICMP from the whole lab supernet, all egress
+      VpcId: !Ref SiteCVpc
+      SecurityGroupIngress:
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !Ref LabSupernetCidr
+          Description: Allow ping from any VPC in this lab
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: SITE_C-SG
+
+  SiteCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SITE_C VPC interface endpoints SG - HTTPS from within the VPC
+      VpcId: !Ref SiteCVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.2.0.0/16
+          Description: Allow HTTPS from SITE_C-VPC instances to the SSM endpoints
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: SITE_C-Endpoint-SG
+
+  SiteCSsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref SiteCVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SiteCPrivateSubnet]
+      SecurityGroupIds: [!Ref SiteCEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  SiteCSsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref SiteCVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SiteCPrivateSubnet]
+      SecurityGroupIds: [!Ref SiteCEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  SiteCEc2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref SiteCVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2messages
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SiteCPrivateSubnet]
+      SecurityGroupIds: [!Ref SiteCEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  SiteCInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !ImportValue VpcLab-InstanceProfile-Name
+      SubnetId: !Ref SiteCPrivateSubnet
+      SecurityGroupIds:
+        - !Ref SiteCSecurityGroup
+      Tags:
+        - Key: Name
+          Value: SITE_C-Instance
+
+  ###########################################################################
+  # SITE_D-VPC (fully private - no IGW, no NAT, no public IPs)
+  ###########################################################################
+  SiteDVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.3.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: SITE_D-VPC
+
+  SiteDPrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref SiteDVpc
+      CidrBlock: 10.3.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: SITE_D-Private-Subnet
+
+  SiteDRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref SiteDVpc
+      Tags:
+        - Key: Name
+          Value: SITE_D-Private-RT
+
+  SiteDSubnetRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SiteDPrivateSubnet
+      RouteTableId: !Ref SiteDRouteTable
+
+  SiteDSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SITE_D instance SG - ICMP from the whole lab supernet, all egress
+      VpcId: !Ref SiteDVpc
+      SecurityGroupIngress:
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !Ref LabSupernetCidr
+          Description: Allow ping from any VPC in this lab
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: SITE_D-SG
+
+  SiteDEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SITE_D VPC interface endpoints SG - HTTPS from within the VPC
+      VpcId: !Ref SiteDVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.3.0.0/16
+          Description: Allow HTTPS from SITE_D-VPC instances to the SSM endpoints
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: SITE_D-Endpoint-SG
+
+  SiteDSsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref SiteDVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SiteDPrivateSubnet]
+      SecurityGroupIds: [!Ref SiteDEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  SiteDSsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref SiteDVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SiteDPrivateSubnet]
+      SecurityGroupIds: [!Ref SiteDEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  SiteDEc2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref SiteDVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2messages
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SiteDPrivateSubnet]
+      SecurityGroupIds: [!Ref SiteDEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  SiteDInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !ImportValue VpcLab-InstanceProfile-Name
+      SubnetId: !Ref SiteDPrivateSubnet
+      SecurityGroupIds:
+        - !Ref SiteDSecurityGroup
+      Tags:
+        - Key: Name
+          Value: SITE_D-Instance
+
+  ###########################################################################
+  # Transit Gateway + explicit route table (default association/propagation
+  # disabled so every attachment/route is created intentionally, for clarity)
+  ###########################################################################
+  LabTransitGateway:
+    Type: AWS::EC2::TransitGateway
+    Properties:
+      Description: VPC Lab Transit Gateway connecting SITE_A/B/C/D
+      AmazonSideAsn: 64512
+      DefaultRouteTableAssociation: disable
+      DefaultRouteTablePropagation: disable
+      DnsSupport: enable
+      VpnEcmpSupport: enable
+      Tags:
+        - Key: Name
+          Value: VpcLab-TGW
+
+  LabTgwRouteTable:
+    Type: AWS::EC2::TransitGatewayRouteTable
+    Properties:
+      TransitGatewayId: !Ref LabTransitGateway
+      Tags:
+        - Key: Name
+          Value: VpcLab-TGW-RouteTable
+
+  # --- Attachments (one per VPC) ---
+  SiteAAttachment:
+    Type: AWS::EC2::TransitGatewayAttachment
+    Properties:
+      TransitGatewayId: !Ref LabTransitGateway
+      VpcId: !ImportValue VpcLab-SiteA-VpcId
+      SubnetIds:
+        - !ImportValue VpcLab-SiteA-SubnetId
+      Tags:
+        - Key: Name
+          Value: SITE_A-TGW-Attachment
+
+  SiteBAttachment:
+    Type: AWS::EC2::TransitGatewayAttachment
+    Properties:
+      TransitGatewayId: !Ref LabTransitGateway
+      VpcId: !ImportValue VpcLab-SiteB-VpcId
+      SubnetIds:
+        - !ImportValue VpcLab-SiteB-SubnetId
+      Tags:
+        - Key: Name
+          Value: SITE_B-TGW-Attachment
+
+  SiteCAttachment:
+    Type: AWS::EC2::TransitGatewayAttachment
+    Properties:
+      TransitGatewayId: !Ref LabTransitGateway
+      VpcId: !Ref SiteCVpc
+      SubnetIds:
+        - !Ref SiteCPrivateSubnet
+      Tags:
+        - Key: Name
+          Value: SITE_C-TGW-Attachment
+
+  SiteDAttachment:
+    Type: AWS::EC2::TransitGatewayAttachment
+    Properties:
+      TransitGatewayId: !Ref LabTransitGateway
+      VpcId: !Ref SiteDVpc
+      SubnetIds:
+        - !Ref SiteDPrivateSubnet
+      Tags:
+        - Key: Name
+          Value: SITE_D-TGW-Attachment
+
+  # --- Associate each attachment with the explicit TGW route table ---
+  SiteAAssociation:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties:
+      TransitGatewayAttachmentId: !Ref SiteAAttachment
+      TransitGatewayRouteTableId: !Ref LabTgwRouteTable
+
+  SiteBAssociation:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties:
+      TransitGatewayAttachmentId: !Ref SiteBAttachment
+      TransitGatewayRouteTableId: !Ref LabTgwRouteTable
+
+  SiteCAssociation:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties:
+      TransitGatewayAttachmentId: !Ref SiteCAttachment
+      TransitGatewayRouteTableId: !Ref LabTgwRouteTable
+
+  SiteDAssociation:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties:
+      TransitGatewayAttachmentId: !Ref SiteDAttachment
+      TransitGatewayRouteTableId: !Ref LabTgwRouteTable
+
+  # --- Propagate each VPC's CIDR into the TGW route table ---
+  SiteAPropagation:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Properties:
+      TransitGatewayAttachmentId: !Ref SiteAAttachment
+      TransitGatewayRouteTableId: !Ref LabTgwRouteTable
+
+  SiteBPropagation:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Properties:
+      TransitGatewayAttachmentId: !Ref SiteBAttachment
+      TransitGatewayRouteTableId: !Ref LabTgwRouteTable
+
+  SiteCPropagation:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Properties:
+      TransitGatewayAttachmentId: !Ref SiteCAttachment
+      TransitGatewayRouteTableId: !Ref LabTgwRouteTable
+
+  SiteDPropagation:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Properties:
+      TransitGatewayAttachmentId: !Ref SiteDAttachment
+      TransitGatewayRouteTableId: !Ref LabTgwRouteTable
+
+  ###########################################################################
+  # VPC route table updates: send lab-supernet traffic to the TGW.
+  # The VPC's own local /16 route always wins over this /8 route for
+  # same-VPC traffic (longest-prefix-match), so this one route is enough
+  # to reach all three *other* sites from each VPC.
+  ###########################################################################
+  SiteARouteToTgw:
+    Type: AWS::EC2::Route
+    DependsOn: SiteAAssociation
+    Properties:
+      RouteTableId: !ImportValue VpcLab-SiteA-RouteTableId
+      DestinationCidrBlock: !Ref LabSupernetCidr
+      TransitGatewayId: !Ref LabTransitGateway
+
+  SiteBRouteToTgw:
+    Type: AWS::EC2::Route
+    DependsOn: SiteBAssociation
+    Properties:
+      RouteTableId: !ImportValue VpcLab-SiteB-RouteTableId
+      DestinationCidrBlock: !Ref LabSupernetCidr
+      TransitGatewayId: !Ref LabTransitGateway
+
+  SiteCRouteToTgw:
+    Type: AWS::EC2::Route
+    DependsOn: SiteCAssociation
+    Properties:
+      RouteTableId: !Ref SiteCRouteTable
+      DestinationCidrBlock: !Ref LabSupernetCidr
+      TransitGatewayId: !Ref LabTransitGateway
+
+  SiteDRouteToTgw:
+    Type: AWS::EC2::Route
+    DependsOn: SiteDAssociation
+    Properties:
+      RouteTableId: !Ref SiteDRouteTable
+      DestinationCidrBlock: !Ref LabSupernetCidr
+      TransitGatewayId: !Ref LabTransitGateway
+
+Outputs:
+  TransitGatewayId:
+    Value: !Ref LabTransitGateway
+  TgwRouteTableId:
+    Value: !Ref LabTgwRouteTable
+  SiteCVpcId:
+    Value: !Ref SiteCVpc
+  SiteCInstanceId:
+    Value: !Ref SiteCInstance
+  SiteDVpcId:
+    Value: !Ref SiteDVpc
+  SiteDInstanceId:
+    Value: !Ref SiteDInstance

@@ -1,0 +1,336 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  VPC Lab - Part 1: Creates SITE_A-VPC and SITE_B-VPC, each with a private
+  subnet (no internet gateway, no NAT, no public IPs) and an EC2 instance
+  managed via SSM. Since the instances have no internet route, each VPC gets
+  its own SSM/SSMMessages/EC2Messages interface (PrivateLink) endpoints so
+  the SSM Agent can reach Systems Manager entirely over the AWS private
+  network. Exports IDs for use by Part 2/3 stacks.
+
+Parameters:
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Resolved via SSM Parameter Store so the template works in any region.
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t2.micro]
+
+Resources:
+
+  ###########################################################################
+  # Shared IAM Role for SSM (used by every instance across all three parts)
+  ###########################################################################
+  SsmInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: VpcLab-SSM-InstanceRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: VpcLab-SSM-InstanceRole
+
+  SsmInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: VpcLab-SSM-InstanceProfile
+      Roles:
+        - !Ref SsmInstanceRole
+
+  ###########################################################################
+  # SITE_A-VPC (fully private - no IGW, no NAT, no public IPs)
+  ###########################################################################
+  SiteAVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: SITE_A-VPC
+
+  SiteAPrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref SiteAVpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: SITE_A-Private-Subnet
+
+  SiteARouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref SiteAVpc
+      Tags:
+        - Key: Name
+          Value: SITE_A-Private-RT
+
+  SiteASubnetRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SiteAPrivateSubnet
+      RouteTableId: !Ref SiteARouteTable
+
+  SiteASecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SITE_A instance SG - ICMP from the whole lab supernet, all egress
+      VpcId: !Ref SiteAVpc
+      SecurityGroupIngress:
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 10.0.0.0/8
+          Description: Allow ping from any VPC in this lab (10.0.0.0/16 - 10.3.0.0/16)
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: SITE_A-SG
+
+  # SG for the interface endpoints: only needs HTTPS from inside this VPC.
+  SiteAEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SITE_A VPC interface endpoints SG - HTTPS from within the VPC
+      VpcId: !Ref SiteAVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.0.0/16
+          Description: Allow HTTPS from SITE_A-VPC instances to the SSM endpoints
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: SITE_A-Endpoint-SG
+
+  # Interface (PrivateLink) endpoints so the SSM Agent can reach Systems
+  # Manager without any internet route. Private DNS is enabled so the agent's
+  # normal ssm.<region>.amazonaws.com hostnames resolve to these endpoints.
+  SiteASsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref SiteAVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SiteAPrivateSubnet]
+      SecurityGroupIds: [!Ref SiteAEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  SiteASsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref SiteAVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SiteAPrivateSubnet]
+      SecurityGroupIds: [!Ref SiteAEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  SiteAEc2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref SiteAVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2messages
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SiteAPrivateSubnet]
+      SecurityGroupIds: [!Ref SiteAEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  SiteAInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref SsmInstanceProfile
+      SubnetId: !Ref SiteAPrivateSubnet
+      SecurityGroupIds:
+        - !Ref SiteASecurityGroup
+      Tags:
+        - Key: Name
+          Value: SITE_A-Instance
+
+  ###########################################################################
+  # SITE_B-VPC (fully private - no IGW, no NAT, no public IPs)
+  ###########################################################################
+  SiteBVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.1.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: SITE_B-VPC
+
+  SiteBPrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref SiteBVpc
+      CidrBlock: 10.1.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: SITE_B-Private-Subnet
+
+  SiteBRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref SiteBVpc
+      Tags:
+        - Key: Name
+          Value: SITE_B-Private-RT
+
+  SiteBSubnetRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SiteBPrivateSubnet
+      RouteTableId: !Ref SiteBRouteTable
+
+  SiteBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SITE_B instance SG - ICMP from the whole lab supernet, all egress
+      VpcId: !Ref SiteBVpc
+      SecurityGroupIngress:
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 10.0.0.0/8
+          Description: Allow ping from any VPC in this lab (10.0.0.0/16 - 10.3.0.0/16)
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: SITE_B-SG
+
+  SiteBEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SITE_B VPC interface endpoints SG - HTTPS from within the VPC
+      VpcId: !Ref SiteBVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.1.0.0/16
+          Description: Allow HTTPS from SITE_B-VPC instances to the SSM endpoints
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: SITE_B-Endpoint-SG
+
+  SiteBSsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref SiteBVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SiteBPrivateSubnet]
+      SecurityGroupIds: [!Ref SiteBEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  SiteBSsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref SiteBVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SiteBPrivateSubnet]
+      SecurityGroupIds: [!Ref SiteBEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  SiteBEc2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref SiteBVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2messages
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SiteBPrivateSubnet]
+      SecurityGroupIds: [!Ref SiteBEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  SiteBInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref SsmInstanceProfile
+      SubnetId: !Ref SiteBPrivateSubnet
+      SecurityGroupIds:
+        - !Ref SiteBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: SITE_B-Instance
+
+Outputs:
+  InstanceProfileName:
+    Value: !Ref SsmInstanceProfile
+    Export:
+      Name: VpcLab-InstanceProfile-Name
+
+  SiteAVpcId:
+    Value: !Ref SiteAVpc
+    Export: {Name: VpcLab-SiteA-VpcId}
+  SiteAVpcCidr:
+    Value: !GetAtt SiteAVpc.CidrBlock
+    Export: {Name: VpcLab-SiteA-VpcCidr}
+  SiteASubnetId:
+    Value: !Ref SiteAPrivateSubnet
+    Export: {Name: VpcLab-SiteA-SubnetId}
+  SiteARouteTableId:
+    Value: !Ref SiteARouteTable
+    Export: {Name: VpcLab-SiteA-RouteTableId}
+  SiteASecurityGroupId:
+    Value: !Ref SiteASecurityGroup
+    Export: {Name: VpcLab-SiteA-SecurityGroupId}
+  SiteAInstanceId:
+    Value: !Ref SiteAInstance
+    Export: {Name: VpcLab-SiteA-InstanceId}
+  SiteAInstancePrivateIp:
+    Value: !GetAtt SiteAInstance.PrivateIp
+    Export: {Name: VpcLab-SiteA-InstancePrivateIp}
+
+  SiteBVpcId:
+    Value: !Ref SiteBVpc
+    Export: {Name: VpcLab-SiteB-VpcId}
+  SiteBVpcCidr:
+    Value: !GetAtt SiteBVpc.CidrBlock
+    Export: {Name: VpcLab-SiteB-VpcCidr}
+  SiteBSubnetId:
+    Value: !Ref SiteBPrivateSubnet
+    Export: {Name: VpcLab-SiteB-SubnetId}
+  SiteBRouteTableId:
+    Value: !Ref SiteBRouteTable
+    Export: {Name: VpcLab-SiteB-RouteTableId}
+  SiteBSecurityGroupId:
+    Value: !Ref SiteBSecurityGroup
+    Export: {Name: VpcLab-SiteB-SecurityGroupId}
+  SiteBInstanceId:
+    Value: !Ref SiteBInstance
+    Export: {Name: VpcLab-SiteB-InstanceId}
+  SiteBInstancePrivateIp:
+    Value: !GetAtt SiteBInstance.PrivateIp
+    Export: {Name: VpcLab-SiteB-InstancePrivateIp}
